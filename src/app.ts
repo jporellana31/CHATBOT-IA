@@ -1,66 +1,74 @@
-import "dotenv/config"
-import { createBot, createProvider, createFlow, addKeyword, EVENTS } from '@builderbot/bot'
-import { MemoryDB } from '@builderbot/bot'
-import { BaileysProvider } from '@builderbot/provider-baileys'
-import { toAsk, httpInject } from "@builderbot-plugins/openai-assistants"
-import { typing } from "./utils/presence"
+import "dotenv/config";
+import { createBot, createProvider, createFlow, addKeyword, EVENTS } from "@builderbot/bot";
+import { PostgreSQLAdapter } from "@builderbot/database-postgres";
+import { TwilioProvider } from "@builderbot/provider-twilio";
+import { toAsk, httpInject } from "@builderbot-plugins/openai-assistants";
+import { typing } from "./utils/presence";
 
 /** Puerto en el que se ejecutará el servidor */
-const PORT = process.env.PORT ?? 3008
+const PORT = process.env.PORT ?? 3008;
 /** ID del asistente de OpenAI */
-const ASSISTANT_ID = process.env.ASSISTANT_ID ?? ''
+const ASSISTANT_ID = process.env.ASSISTANT_ID ?? "";
 const userQueues = new Map();
-const userLocks = new Map(); // New lock mechanism
+const userLocks = new Map(); // Mecanismo de bloqueo
 
 /**
- * Function to process the user's message by sending it to the OpenAI API
- * and sending the response back to the user.
+ * Procesa el mensaje del usuario enviándolo a OpenAI y devolviendo la respuesta.
  */
 const processUserMessage = async (ctx, { flowDynamic, state, provider }) => {
     await typing(ctx, provider);
+    
+    const startOpenAI = Date.now();
     const response = await toAsk(ASSISTANT_ID, ctx.body, state);
+    const endOpenAI = Date.now();
+    console.log(`⏳ OpenAI Response Time: ${(endOpenAI - startOpenAI) / 1000} segundos`);
 
-    // Split the response into chunks and send them sequentially
+    // Divide la respuesta en fragmentos y los envía secuencialmente
     const chunks = response.split(/\n\n+/);
     for (const chunk of chunks) {
         const cleanedChunk = chunk.trim().replace(/【.*?】[ ] /g, "");
+        
+        const startTwilio = Date.now();
         await flowDynamic([{ body: cleanedChunk }]);
+        const endTwilio = Date.now();
+        console.log(`📤 Twilio Send Time: ${(endTwilio - startTwilio) / 1000} segundos`);
     }
 };
 
 /**
- * Function to handle the queue for each user.
+ * Maneja la cola de mensajes para cada usuario.
  */
 const handleQueue = async (userId) => {
     const queue = userQueues.get(userId);
     
     if (userLocks.get(userId)) {
-        return; // If locked, skip processing
+        return; // Si está bloqueado, omitir procesamiento
     }
-
+    
+    console.log(`📩 Mensajes en la cola de ${userId}:`, queue.length);
+    
     while (queue.length > 0) {
-        userLocks.set(userId, true); // Lock the queue
+        userLocks.set(userId, true); // Bloquear la cola
         const { ctx, flowDynamic, state, provider } = queue.shift();
         try {
             await processUserMessage(ctx, { flowDynamic, state, provider });
         } catch (error) {
-            console.error(`Error processing message for user ${userId}:`, error);
+            console.error(`Error procesando mensaje para el usuario ${userId}:`, error);
         } finally {
-            userLocks.set(userId, false); // Release the lock
+            userLocks.set(userId, false); // Liberar el bloqueo
         }
     }
 
-    userLocks.delete(userId); // Remove the lock once all messages are processed
-    userQueues.delete(userId); // Remove the queue once all messages are processed
+    userLocks.delete(userId); // Eliminar bloqueo una vez procesados todos los mensajes
+    userQueues.delete(userId); // Eliminar la cola cuando se procesen todos los mensajes
 };
 
 /**
  * Flujo de bienvenida que maneja las respuestas del asistente de IA
- * @type {import('@builderbot/bot').Flow<BaileysProvider, MemoryDB>}
  */
-const welcomeFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
+const welcomeFlow = addKeyword(EVENTS.WELCOME)
     .addAction(async (ctx, { flowDynamic, state, provider }) => {
-        const userId = ctx.from; // Use the user's ID to create a unique queue for each user
+        const userId = ctx.from; // Identificador único por usuario
 
         if (!userQueues.has(userId)) {
             userQueues.set(userId, []);
@@ -69,43 +77,35 @@ const welcomeFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
         const queue = userQueues.get(userId);
         queue.push({ ctx, flowDynamic, state, provider });
 
-        // If this is the only message in the queue, process it immediately
+        // Si este es el único mensaje en la cola, procesarlo inmediatamente
         if (!userLocks.get(userId) && queue.length === 1) {
             await handleQueue(userId);
         }
     });
 
 /**
- * Función principal que configura y inicia el bot
- * @async
- * @returns {Promise<void>}
+ * Función principal que configura e inicia el bot
  */
 const main = async () => {
-    /**
-     * Flujo del bot
-     * @type {import('@builderbot/bot').Flow<BaileysProvider, MemoryDB>}
-     */
     const adapterFlow = createFlow([welcomeFlow]);
 
-    /**
-     * Proveedor de servicios de mensajería
-     * @type {BaileysProvider}
-     */
-    const adapterProvider = createProvider(BaileysProvider, {
-        groupsIgnore: true,
-        readStatus: false,
+    const adapterProvider = createProvider(TwilioProvider, {
+        accountSid: process.env.ACCOUNT_SID,
+        authToken: process.env.AUTH_TOKEN,
+        vendorNumber: process.env.VENDOR_NUMBER,
     });
 
-    /**
-     * Base de datos en memoria para el bot
-     * @type {MemoryDB}
-     */
-    const adapterDB = new MemoryDB();
+    const startDB = Date.now();
+    const adapterDB = new PostgreSQLAdapter({
+        host: process.env.POSTGRES_DB_HOST,
+        user: process.env.POSTGRES_DB_USER,
+        database: process.env.POSTGRES_DB_NAME,
+        password: process.env.POSTGRES_DB_PASSWORD,
+        port: Number(process.env.POSTGRES_DB_PORT),
+    });
+    const endDB = Date.now();
+    console.log(`🗄️ PostgreSQL Query Time: ${(endDB - startDB) / 1000} segundos`);
 
-    /**
-     * Configuración y creación del bot
-     * @type {import('@builderbot/bot').Bot<BaileysProvider, MemoryDB>}
-     */
     const { httpServer } = await createBot({
         flow: adapterFlow,
         provider: adapterProvider,
